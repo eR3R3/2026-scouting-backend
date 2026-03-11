@@ -11,6 +11,7 @@ import {
 import { TBAEvent } from './tba-event.entity';
 import { TBAMatch } from './tba-match.entity';
 import { Team } from '../team/team.entity';
+import { EventSourceType } from '../event/scout-event.entity';
 import { ScoutEvent } from '../event/scout-event.entity';
 import { EventTeam, EventTeamSource } from '../event/event-team.entity';
 import { EventMatch, EventMatchSource } from '../event/event-match.entity';
@@ -99,8 +100,10 @@ export class TBAService {
         );
       }
 
+      console.log(`TBA API response for teams: ${response.data?.length || 0} items`);
       return response.data;
     } catch (error) {
+      console.error(`Failed to fetch teams for event ${eventKey}:`, error.message);
       throw new HttpException(
         `Failed to fetch teams for event ${eventKey}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
@@ -126,8 +129,10 @@ export class TBAService {
         );
       }
 
+      console.log(`TBA API response for matches: ${response.data?.length || 0} items`);
       return response.data;
     } catch (error) {
+      console.error(`Failed to fetch matches for event ${eventKey}:`, error.message);
       throw new HttpException(
         `Failed to fetch matches for event ${eventKey}`,
         HttpStatus.INTERNAL_SERVER_ERROR,
@@ -219,6 +224,23 @@ export class TBAService {
       const eventData = await this.getEventDetails(eventKey);
       await this.saveEvent(eventData);
       console.log(`Saved event: ${eventData.name}`);
+
+      // Find or create ScoutEvent
+      let scoutEvent = await this.scoutEventRepository.findOne({
+        where: { tbaEventKey: eventKey },
+      });
+      if (!scoutEvent) {
+        console.log('Creating ScoutEvent for TBA event...');
+        scoutEvent = this.scoutEventRepository.create({
+          name: eventData.name,
+          sourceType: EventSourceType.TBA,
+          tbaEventKey: eventKey,
+          syncEnabled: true,
+          syncIntervalMinutes: 30,
+        });
+        await this.scoutEventRepository.save(scoutEvent);
+        console.log(`Created ScoutEvent: ${scoutEvent.name}`);
+      }
 
       // Sync matches
       console.log('Fetching event matches...');
@@ -334,19 +356,40 @@ export class TBAService {
       return;
     }
 
-    // Teams: project from Team table based on TBAMatch alliances for this event.
+    // Teams: Get from TBA teams API, not just from match alliances
+    console.log('Fetching teams from TBA API for projections...');
+    const tbaTeams = await this.getEventTeams(eventKey);
+    console.log(`Found ${tbaTeams.length} teams from TBA API`);
+
+    // Add teams from TBA API
+    for (const tbaTeam of tbaTeams) {
+      const teamNumber = tbaTeam.team_number;
+      const exists = await this.eventTeamRepository.findOne({
+        where: { scoutEventId: scoutEvent.id, teamNumber },
+      });
+      if (exists) continue;
+
+      const et = this.eventTeamRepository.create({
+        scoutEventId: scoutEvent.id,
+        teamNumber,
+        source: EventTeamSource.TBA,
+      });
+      await this.eventTeamRepository.save(et);
+    }
+
+    // Also add teams from match alliances (if matches exist)
     const tbaMatches = await this.matchRepository.find({
       where: { eventKey },
       order: { matchNumber: 'ASC' },
     });
 
-    const teamNumbers = new Set<number>();
+    const teamNumbersFromMatches = new Set<number>();
     for (const m of tbaMatches) {
-      (m.redAlliance || []).forEach((n) => teamNumbers.add(n));
-      (m.blueAlliance || []).forEach((n) => teamNumbers.add(n));
+      (m.redAlliance || []).forEach((n) => teamNumbersFromMatches.add(n));
+      (m.blueAlliance || []).forEach((n) => teamNumbersFromMatches.add(n));
     }
 
-    for (const teamNumber of teamNumbers) {
+    for (const teamNumber of teamNumbersFromMatches) {
       const exists = await this.eventTeamRepository.findOne({
         where: { scoutEventId: scoutEvent.id, teamNumber },
       });
